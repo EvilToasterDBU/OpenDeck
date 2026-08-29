@@ -112,12 +112,6 @@ fn endpoint_addresses() -> Vec<String> {
 	local_ipv4().map(|ip| vec![ip.to_string()]).unwrap_or_else(|| vec!["127.0.0.1".to_owned()])
 }
 
-#[derive(serde::Serialize, Clone)]
-pub struct PairingCandidate {
-	pub name: String,
-	pub payload: String,
-}
-
 #[derive(serde::Serialize)]
 pub struct PairingInfo {
 	pub qr_url: String,
@@ -425,6 +419,7 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr) -> anyhow::Result<()
 																	frame_len,
 																	frame_prefix
 																);
+																send_encrypted(&ws_tx, &boxed, virtual_device_list(&format!("sdm-{key_id}"))).await?;
 																log::info!("[VSD2] waiting for next ClientMessage after authentication on {peer}");
 															}
 															Err(_) => log::error!("[VSD2] failed to encrypt authentication OK for {peer}"),
@@ -483,6 +478,20 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr) -> anyhow::Result<()
 						continue;
 					}
 				};
+
+				if !authenticated
+					&& !matches!(
+						&client.payload,
+						Some(
+							client_message::Payload::Hello(_)
+								| client_message::Payload::Authenticate(_)
+								| client_message::Payload::CancelAuthenticate(_)
+								| client_message::Payload::ClientCapabilities(_)
+						)
+					) {
+					log::warn!("[VSD2] ignoring unauthenticated client message from {peer}");
+					continue;
+				}
 
 				match client.payload {
 					Some(client_message::Payload::Hello(hello)) => {
@@ -551,6 +560,11 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr) -> anyhow::Result<()
 						log::debug!("[VSD2] TX HelloFromServer to {peer}: {} bytes", encoded.len());
 
 						ws_tx.send(WsMessage::Binary(encoded.into())).await?;
+						if already_authenticated {
+							let peer_key = PublicKey::from(<[u8; 32]>::try_from(hello.public_key.as_slice()).map_err(|_| anyhow::anyhow!("Stream Deck Mobile sent an invalid public key"))?);
+							let cipher = SalsaBox::new(&peer_key, &server_secret_key());
+							send_encrypted(&ws_tx, &cipher, virtual_device_list(&format!("sdm-{key_id}"))).await?;
+						}
 
 						log::info!("[VSD2] HelloFromServer sent to {peer}; waiting for Mobile auth request");
 					}
@@ -680,6 +694,16 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr) -> anyhow::Result<()
 					}
 
 					Some(client_message::Payload::OpenVirtualDevice(open)) => {
+						if device_id.as_deref() != Some(open.device_id.as_str()) {
+							log::warn!(
+								"[VSD2] rejecting OpenVirtualDevice from {peer}: requested device={} does not match this Mobile identity",
+								open.device_id
+							);
+							let response = error_response(open.request_id, ErrorCode::AuthenticationRejected, "Virtual device does not belong to this Mobile identity");
+							ws_tx.send(WsMessage::Binary(response.encode_to_vec().into())).await?;
+							continue;
+						}
+
 						let (rows, columns) = open
 							.keypad_config
 							.as_ref()
@@ -742,8 +766,37 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr) -> anyhow::Result<()
 					}
 
 					Some(client_message::Payload::KeyPress(key)) => {
-						if let Some(id) = device_id.as_ref() {
-							log::info!("[VSD2] KeyPress from {peer}: device={} index={} pressed={}", id, key.index, key.pressed);
+						let Some(id) = device_id.as_ref() else {
+							log::warn!("[VSD2] ignoring KeyPress from {peer} before a virtual device was opened");
+							continue;
+						};
+
+						let Some(device) = crate::shared::DEVICES.get(id) else {
+							log::warn!("[VSD2] ignoring KeyPress from {peer} for unavailable device {id}");
+							continue;
+						};
+						let key_count = u32::from(device.rows) * u32::from(device.columns);
+						drop(device);
+
+						if key.index >= key_count || key.index > u32::from(u8::MAX) {
+							log::warn!("[VSD2] ignoring out-of-range KeyPress from {peer}: device={id} index={} key_count={key_count}", key.index);
+							continue;
+						}
+
+						log::info!("[VSD2] KeyPress from {peer}: device={id} index={} pressed={}", key.index, key.pressed);
+						let event = crate::events::inbound::PayloadEvent {
+							payload: crate::events::inbound::devices::PressPayload {
+								device: id.clone(),
+								position: key.index as u8,
+							},
+						};
+						let result = if key.pressed {
+							crate::events::inbound::devices::key_down(event).await
+						} else {
+							crate::events::inbound::devices::key_up(event).await
+						};
+						if let Err(error) = result {
+							log::warn!("[VSD2] failed to dispatch KeyPress from {peer}: {error}");
 						}
 					}
 
@@ -822,6 +875,29 @@ fn error_response(request_id: u32, code: ErrorCode, reason: &str) -> ServerMessa
 			reason: Some(reason.to_owned()),
 		})),
 	}
+}
+
+fn virtual_device_list(device_id: &str) -> ServerMessage {
+	ServerMessage {
+		payload: Some(server_message::Payload::VirtualDeviceList(VirtualDeviceList {
+			devices: vec![VirtualDevice {
+				id: device_id.to_owned(),
+				name: "Stream Deck Mobile".to_owned(),
+			}],
+		})),
+	}
+}
+
+async fn send_encrypted(tx: &mpsc::Sender<WsMessage>, cipher: &SalsaBox, message: ServerMessage) -> anyhow::Result<()> {
+	let nonce = SalsaBox::generate_nonce(&mut OsRng);
+	let ciphertext = cipher
+		.encrypt(&nonce, message.encode_to_vec().as_slice())
+		.map_err(|error| anyhow::anyhow!("failed to encrypt VSD2 response: {error:?}"))?;
+	let mut frame = Vec::with_capacity(24 + ciphertext.len());
+	frame.extend_from_slice(nonce.as_slice());
+	frame.extend_from_slice(&ciphertext);
+	tx.send(WsMessage::Binary(frame.into())).await?;
+	Ok(())
 }
 
 async fn register_open_deck_device(device_id: &str, name: &str, (rows, columns): (u8, u8)) -> anyhow::Result<()> {
