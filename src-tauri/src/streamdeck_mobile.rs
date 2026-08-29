@@ -459,6 +459,47 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr) -> anyhow::Result<()
 														}
 													}
 												}
+												Ok(ClientMessage {
+													payload: Some(client_message::Payload::OpenVirtualDevice(open)),
+												}) => {
+													if !authenticated || device_id.as_deref() != Some(open.device_id.as_str()) {
+														log::warn!("[VSD2] rejecting encrypted OpenVirtualDevice from {peer}: invalid session or device identity");
+														send_encrypted(
+															&ws_tx,
+															&boxed,
+															error_response(open.request_id, ErrorCode::AuthenticationRejected, "Virtual device does not belong to this Mobile identity"),
+														)
+														.await?;
+														continue;
+													}
+
+													let (rows, columns) = open
+														.keypad_config
+														.as_ref()
+														.and_then(|config| config.layout_crop.as_ref())
+														.map(|size| (size.height.clamp(1, 255) as u8, size.width.clamp(1, 255) as u8))
+														.unwrap_or((DEFAULT_ROWS, DEFAULT_COLS));
+													register_open_deck_device(&open.device_id, "Stream Deck Mobile", (rows, columns)).await?;
+													CLIENTS.write().await.insert(open.device_id.clone(), ClientHandle { tx: ws_tx.clone() });
+													device_id = Some(open.device_id.clone());
+
+													send_encrypted(
+														&ws_tx,
+														&boxed,
+														ServerMessage {
+															payload: Some(server_message::Payload::VirtualDeviceOpened(VirtualDeviceOpened {
+																request_id: open.request_id,
+																device: Some(VirtualDevice {
+																	id: open.device_id.clone(),
+																	name: "Stream Deck Mobile".to_owned(),
+																}),
+															})),
+														},
+													)
+													.await?;
+													send_encrypted(&ws_tx, &boxed, context_message(rows, columns)).await?;
+													log::info!("[VSD2] encrypted OpenVirtualDevice ready: {} ({}x{})", open.device_id, rows, columns);
+												}
 												Ok(other) => {
 													log::warn!("[VSD2] decrypted non-Authenticate ClientMessage from {peer}: {:?}", other.payload);
 												}
@@ -928,13 +969,7 @@ async fn deregister_open_deck_device(device_id: &str) {
 	let _ = crate::events::inbound::devices::deregister_device("", crate::events::inbound::PayloadEvent { payload: device_id.to_owned() }).await;
 }
 
-async fn send_context(tx: &mpsc::Sender<WsMessage>, keypad: &KeypadConfig) -> anyhow::Result<()> {
-	let (rows, columns) = keypad
-		.layout_crop
-		.as_ref()
-		.map(|size| (size.height.clamp(1, 255) as u8, size.width.clamp(1, 255) as u8))
-		.unwrap_or((DEFAULT_ROWS, DEFAULT_COLS));
-
+fn context_message(rows: u8, columns: u8) -> ServerMessage {
 	let actions = (0..(rows as u32 * columns as u32))
 		.map(|index| Action {
 			index,
@@ -945,16 +980,23 @@ async fn send_context(tx: &mpsc::Sender<WsMessage>, keypad: &KeypadConfig) -> an
 		})
 		.collect();
 
-	let message = ServerMessage {
+	ServerMessage {
 		payload: Some(server_message::Payload::Context(Context {
 			profile_id: "opendeck-mobile-profile".to_owned(),
 			total_pages: 1,
 			current_page: 0,
 			actions,
 		})),
-	};
+	}
+}
 
-	tx.send(WsMessage::Binary(message.encode_to_vec().into())).await?;
+async fn send_context(tx: &mpsc::Sender<WsMessage>, keypad: &KeypadConfig) -> anyhow::Result<()> {
+	let (rows, columns) = keypad
+		.layout_crop
+		.as_ref()
+		.map(|size| (size.height.clamp(1, 255) as u8, size.width.clamp(1, 255) as u8))
+		.unwrap_or((DEFAULT_ROWS, DEFAULT_COLS));
+	tx.send(WsMessage::Binary(context_message(rows, columns).encode_to_vec().into())).await?;
 	Ok(())
 }
 
