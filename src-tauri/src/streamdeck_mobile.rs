@@ -484,6 +484,20 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr) -> anyhow::Result<()
 					}
 				};
 
+				if !authenticated
+					&& !matches!(
+						&client.payload,
+						Some(
+							client_message::Payload::Hello(_)
+								| client_message::Payload::Authenticate(_)
+								| client_message::Payload::CancelAuthenticate(_)
+								| client_message::Payload::ClientCapabilities(_)
+						)
+					) {
+					log::warn!("[VSD2] ignoring unauthenticated client message from {peer}");
+					continue;
+				}
+
 				match client.payload {
 					Some(client_message::Payload::Hello(hello)) => {
 						let info = hello.client_information.as_ref();
@@ -680,6 +694,16 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr) -> anyhow::Result<()
 					}
 
 					Some(client_message::Payload::OpenVirtualDevice(open)) => {
+						if device_id.as_deref() != Some(open.device_id.as_str()) {
+							log::warn!(
+								"[VSD2] rejecting OpenVirtualDevice from {peer}: requested device={} does not match this Mobile identity",
+								open.device_id
+							);
+							let response = error_response(open.request_id, ErrorCode::AuthenticationRejected, "Virtual device does not belong to this Mobile identity");
+							ws_tx.send(WsMessage::Binary(response.encode_to_vec().into())).await?;
+							continue;
+						}
+
 						let (rows, columns) = open
 							.keypad_config
 							.as_ref()
@@ -742,8 +766,37 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr) -> anyhow::Result<()
 					}
 
 					Some(client_message::Payload::KeyPress(key)) => {
-						if let Some(id) = device_id.as_ref() {
-							log::info!("[VSD2] KeyPress from {peer}: device={} index={} pressed={}", id, key.index, key.pressed);
+						let Some(id) = device_id.as_ref() else {
+							log::warn!("[VSD2] ignoring KeyPress from {peer} before a virtual device was opened");
+							continue;
+						};
+
+						let Some(device) = crate::shared::DEVICES.get(id) else {
+							log::warn!("[VSD2] ignoring KeyPress from {peer} for unavailable device {id}");
+							continue;
+						};
+						let key_count = u32::from(device.rows) * u32::from(device.columns);
+						drop(device);
+
+						if key.index >= key_count || key.index > u32::from(u8::MAX) {
+							log::warn!("[VSD2] ignoring out-of-range KeyPress from {peer}: device={id} index={} key_count={key_count}", key.index);
+							continue;
+						}
+
+						log::info!("[VSD2] KeyPress from {peer}: device={id} index={} pressed={}", key.index, key.pressed);
+						let event = crate::events::inbound::PayloadEvent {
+							payload: crate::events::inbound::devices::PressPayload {
+								device: id.clone(),
+								position: key.index as u8,
+							},
+						};
+						let result = if key.pressed {
+							crate::events::inbound::devices::key_down(event).await
+						} else {
+							crate::events::inbound::devices::key_up(event).await
+						};
+						if let Err(error) = result {
+							log::warn!("[VSD2] failed to dispatch KeyPress from {peer}: {error}");
 						}
 					}
 

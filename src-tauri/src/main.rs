@@ -110,8 +110,6 @@ async fn main() {
 			streamdeck_mobile::streamdeck_mobile_pairing_info,
 			streamdeck_mobile::streamdeck_mobile_pending_pairings,
 			streamdeck_mobile::streamdeck_mobile_resolve_pairing,
-			streamdeck_mobile::streamdeck_mobile_pending_pairings,
-			streamdeck_mobile::streamdeck_mobile_resolve_pairing,
 		])
 		.setup(|app| {
 			APP_HANDLE.set(app.handle().clone()).unwrap();
