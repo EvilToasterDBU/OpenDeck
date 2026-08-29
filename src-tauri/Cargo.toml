@@ -13,6 +13,7 @@ tauri-build = { version = "2.5", features = [] }
 built = { version = "0.8", features = ["dependency-tree", "git2"] }
 
 [dependencies]
+crypto_box = "0.9.1"
 # Large, fundamental libraries
 tauri = { version = "2.10", features = ["devtools", "tray-icon"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -22,7 +23,7 @@ tokio-tungstenite = "0.28"
 tiny_http = "0.12"
 elgato-streamdeck = { version = "0.13", default-features = false, features = ["async"] }
 hidapi = "2.6"
-image = { version = "0.25", default-features = false, features = ["bmp", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png"] }
 streamdeck-strip-render = { git = "https://github.com/FrostyCoolSlug/streamdeck-strip-render", rev = "23fa1399" }
 
 # Smaller utility libraries
@@ -45,6 +46,9 @@ json-patch = "4.1"
 os_info = "3.14"
 urlencoding = "2.1"
 base64 = "0.22"
+qrcodegen = "1.8"
+prost = "0.14"
+blake2 = "0.10"
 reqwest = { version = "0.13", features = ["json"] }
 zip = { version = "6.0", default-features = false, features = ["deflate", "zstd"] }
 active-win-pos-rs = "0.10"

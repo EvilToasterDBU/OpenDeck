@@ -27,6 +27,10 @@ fn extract_average_colour(img: &image::DynamicImage) -> (u8, u8, u8) {
 }
 
 pub async fn update_image(context: &crate::shared::Context, image: Option<&str>) -> Result<(), anyhow::Error> {
+	if crate::streamdeck_mobile::is_mobile_device(&context.device) {
+		crate::streamdeck_mobile::update_image(&context.device, context.position, image).await?;
+		return Ok(());
+	}
 	if let Some(device) = ELGATO_DEVICES.read().await.get(&context.device) {
 		let kind = device.kind();
 		if !kind.is_visual() {
@@ -99,6 +103,9 @@ async fn clear_all_touchpoints(device: &AsyncStreamDeck) {
 }
 
 pub async fn clear_screen(id: &str) -> Result<(), anyhow::Error> {
+	if crate::streamdeck_mobile::clear_screen(id).await {
+		return Ok(());
+	}
 	if let Some(device) = ELGATO_DEVICES.read().await.get(id) {
 		device.clear_all_button_images().await?;
 		if let Some(lcd_format) = device.kind().lcd_image_format() {

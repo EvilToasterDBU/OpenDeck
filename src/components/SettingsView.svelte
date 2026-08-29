@@ -7,6 +7,7 @@
 	import Star from "phosphor-svelte/lib/Star";
 	import Popup from "./Popup.svelte";
 	import Tooltip from "./Tooltip.svelte";
+	import StreamDeckMobilePairing from "./StreamDeckMobilePairing.svelte";
 
 	import { t } from "$lib/i18n";
 	import { settings } from "$lib/settings";
@@ -17,6 +18,7 @@
 	import { message } from "@tauri-apps/plugin-dialog";
 
 	let showPopup: boolean;
+	let showMobilePairing = false;
 	let buildInfo: string;
 	(async () => (buildInfo = await invoke("get_build_info")))();
 
@@ -159,6 +161,15 @@
 		{/if}
 
 		<div class="flex flex-row items-center m-2 space-x-2">
+			<button
+				class="px-3 py-1 text-sm text-neutral-300 bg-neutral-700 hover:bg-neutral-600 transition-colors border border-neutral-600 rounded-lg"
+				on:click={() => (showMobilePairing = true)}
+			>
+				Add Stream Deck Mobile
+			</button>
+		</div>
+
+		<div class="flex flex-row items-center m-2 space-x-2">
 			<label for="settings-developer" class="text-neutral-400">{$t("settings.developer")}</label>
 			<input type="checkbox" bind:checked={$settings.developer} id="settings-developer" />
 			<Tooltip>
@@ -226,3 +237,5 @@
 		</div>
 	</svelte:fragment>
 </Popup>
+
+<StreamDeckMobilePairing bind:show={showMobilePairing} />

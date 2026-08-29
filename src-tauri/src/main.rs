@@ -10,6 +10,7 @@ mod plugins;
 mod power_events;
 mod shared;
 mod store;
+mod streamdeck_mobile;
 mod zip_extract;
 
 mod built_info {
@@ -106,6 +107,11 @@ async fn main() {
 			frontend::settings::get_build_info,
 			frontend::settings::backup_config_directory,
 			frontend::settings::restore_config_directory,
+			streamdeck_mobile::streamdeck_mobile_pairing_info,
+			streamdeck_mobile::streamdeck_mobile_pending_pairings,
+			streamdeck_mobile::streamdeck_mobile_resolve_pairing,
+			streamdeck_mobile::streamdeck_mobile_pending_pairings,
+			streamdeck_mobile::streamdeck_mobile_resolve_pairing,
 		])
 		.setup(|app| {
 			APP_HANDLE.set(app.handle().clone()).unwrap();
@@ -198,6 +204,10 @@ If you have already donated, thank you so much for your support!"#,
 					elgato::initialise_devices().await;
 					tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 				}
+			});
+
+			tokio::spawn(async {
+				streamdeck_mobile::start().await;
 			});
 
 			tokio::spawn(async {
@@ -368,7 +378,6 @@ If you have already donated, thank you so much for your support!"#,
 				.build(),
 		)
 		.plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec!["--hide"])))
-		.plugin(tauri_plugin_dialog::init())
 		.plugin(tauri_plugin_deep_link::init())
 		.on_window_event(|window, event| {
 			if window.label() != "main" {

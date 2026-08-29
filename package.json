@@ -35,7 +35,8 @@
 		"marked": "^17.0",
 		"marked-alert": "^2.1",
 		"marked-base-url": "^1.1",
-		"phosphor-svelte": "^2.0"
+		"phosphor-svelte": "^2.0",
+		"qrcode": "^1.5.4"
 	},
 	"prettier": {
 		"useTabs": true,
