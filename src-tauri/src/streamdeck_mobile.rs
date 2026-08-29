@@ -112,12 +112,6 @@ fn endpoint_addresses() -> Vec<String> {
 	local_ipv4().map(|ip| vec![ip.to_string()]).unwrap_or_else(|| vec!["127.0.0.1".to_owned()])
 }
 
-#[derive(serde::Serialize, Clone)]
-pub struct PairingCandidate {
-	pub name: String,
-	pub payload: String,
-}
-
 #[derive(serde::Serialize)]
 pub struct PairingInfo {
 	pub qr_url: String,
@@ -425,6 +419,7 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr) -> anyhow::Result<()
 																	frame_len,
 																	frame_prefix
 																);
+																send_encrypted(&ws_tx, &boxed, virtual_device_list(&format!("sdm-{key_id}"))).await?;
 																log::info!("[VSD2] waiting for next ClientMessage after authentication on {peer}");
 															}
 															Err(_) => log::error!("[VSD2] failed to encrypt authentication OK for {peer}"),
@@ -565,6 +560,11 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr) -> anyhow::Result<()
 						log::debug!("[VSD2] TX HelloFromServer to {peer}: {} bytes", encoded.len());
 
 						ws_tx.send(WsMessage::Binary(encoded.into())).await?;
+						if already_authenticated {
+							let peer_key = PublicKey::from(<[u8; 32]>::try_from(hello.public_key.as_slice()).map_err(|_| anyhow::anyhow!("Stream Deck Mobile sent an invalid public key"))?);
+							let cipher = SalsaBox::new(&peer_key, &server_secret_key());
+							send_encrypted(&ws_tx, &cipher, virtual_device_list(&format!("sdm-{key_id}"))).await?;
+						}
 
 						log::info!("[VSD2] HelloFromServer sent to {peer}; waiting for Mobile auth request");
 					}
@@ -875,6 +875,29 @@ fn error_response(request_id: u32, code: ErrorCode, reason: &str) -> ServerMessa
 			reason: Some(reason.to_owned()),
 		})),
 	}
+}
+
+fn virtual_device_list(device_id: &str) -> ServerMessage {
+	ServerMessage {
+		payload: Some(server_message::Payload::VirtualDeviceList(VirtualDeviceList {
+			devices: vec![VirtualDevice {
+				id: device_id.to_owned(),
+				name: "Stream Deck Mobile".to_owned(),
+			}],
+		})),
+	}
+}
+
+async fn send_encrypted(tx: &mpsc::Sender<WsMessage>, cipher: &SalsaBox, message: ServerMessage) -> anyhow::Result<()> {
+	let nonce = SalsaBox::generate_nonce(&mut OsRng);
+	let ciphertext = cipher
+		.encrypt(&nonce, message.encode_to_vec().as_slice())
+		.map_err(|error| anyhow::anyhow!("failed to encrypt VSD2 response: {error:?}"))?;
+	let mut frame = Vec::with_capacity(24 + ciphertext.len());
+	frame.extend_from_slice(nonce.as_slice());
+	frame.extend_from_slice(&ciphertext);
+	tx.send(WsMessage::Binary(frame.into())).await?;
+	Ok(())
 }
 
 async fn register_open_deck_device(device_id: &str, name: &str, (rows, columns): (u8, u8)) -> anyhow::Result<()> {
