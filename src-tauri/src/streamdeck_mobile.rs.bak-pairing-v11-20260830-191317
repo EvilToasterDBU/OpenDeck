@@ -18,6 +18,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -29,6 +30,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, mpsc};
 
 const PORT: u16 = 28198;
+const LEGACY_PORT: u16 = 28197;
 const SERVICE_TYPE: &str = "_elg._tcp.local.";
 const DEFAULT_COLS: u8 = 5;
 const DEFAULT_ROWS: u8 = 3;
@@ -63,7 +65,6 @@ fn mobile_debug_log(event: &str) {
 }
 
 static STARTED: OnceLock<()> = OnceLock::new();
-static SERVER_KEY: OnceLock<Vec<u8>> = OnceLock::new();
 static CLIENTS: LazyLock<RwLock<HashMap<String, ClientHandle>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
 #[derive(Clone, serde::Serialize)]
 pub struct PendingPairing {
@@ -77,13 +78,129 @@ static PENDING_PAIRINGS: LazyLock<RwLock<HashMap<String, PendingPairing>>> = Laz
 
 static CLIENT_PUBLIC_KEYS: LazyLock<RwLock<HashMap<String, Vec<u8>>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedMobileDeviceCurrentV47 {
+	fingerprint: String,
+	public_key_b64: String,
+	name: String,
+	rows: u8,
+	columns: u8,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
+struct PersistedMobileStateCurrentV47 {
+	devices: Vec<PersistedMobileDeviceCurrentV47>,
+}
+
+fn mobile_state_path_current_v47() -> std::path::PathBuf {
+	if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+		return std::path::PathBuf::from(xdg).join("opendeck").join("streamdeck-mobile.json");
+	}
+	if let Some(home) = std::env::var_os("HOME") {
+		return std::path::PathBuf::from(home).join(".config").join("opendeck").join("streamdeck-mobile.json");
+	}
+	std::path::PathBuf::from("streamdeck-mobile.json")
+}
+
+const CURRENT_V47_DESKTOP_NAME: &str = "OpenDeck";
+const CURRENT_V47_MOBILE_DEVICE_NAME: &str = "Open Deck Mobile";
+
+async fn load_mobile_state_current_v47() -> anyhow::Result<PersistedMobileStateCurrentV47> {
+	match tokio::fs::read(mobile_state_path_current_v47()).await {
+		Ok(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_default()),
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+		Err(e) => Err(e.into()),
+	}
+}
+
+async fn save_mobile_state_current_v47(state: &PersistedMobileStateCurrentV47) -> anyhow::Result<()> {
+	let path = mobile_state_path_current_v47();
+	if let Some(parent) = path.parent() {
+		tokio::fs::create_dir_all(parent).await?;
+	}
+	let tmp = path.with_extension("json.tmp");
+	tokio::fs::write(&tmp, serde_json::to_vec_pretty(state)?).await?;
+	tokio::fs::rename(tmp, path).await?;
+	Ok(())
+}
+
+async fn persist_mobile_approval_current_v47(fingerprint: &str, public_key: &[u8], rows: u8, columns: u8) -> anyhow::Result<()> {
+	if public_key.len() != 32 {
+		return Err(anyhow::anyhow!("invalid Mobile public key length {}", public_key.len()));
+	}
+	let mut state = load_mobile_state_current_v47().await?;
+	let name = state
+		.devices
+		.iter()
+		.find(|d| d.fingerprint == fingerprint)
+		.map(|d| d.name.clone())
+		.unwrap_or_else(|| CURRENT_V47_MOBILE_DEVICE_NAME.to_owned());
+	let rec = PersistedMobileDeviceCurrentV47 {
+		fingerprint: fingerprint.to_owned(),
+		public_key_b64: base64::engine::general_purpose::STANDARD.encode(public_key),
+		name,
+		rows: rows.max(1),
+		columns: columns.max(1),
+	};
+	if let Some(d) = state.devices.iter_mut().find(|d| d.fingerprint == fingerprint) {
+		*d = rec
+	} else {
+		state.devices.push(rec)
+	}
+	save_mobile_state_current_v47(&state).await
+}
+
+async fn persist_mobile_layout_current_v47(device_id: &str, rows: u8, columns: u8) -> anyhow::Result<()> {
+	let Some(fp) = device_id.strip_prefix("sdm-") else {
+		return Ok(());
+	};
+	let mut state = load_mobile_state_current_v47().await?;
+	if let Some(d) = state.devices.iter_mut().find(|d| d.fingerprint == fp) {
+		d.rows = rows.max(1);
+		d.columns = columns.max(1);
+		save_mobile_state_current_v47(&state).await?;
+	}
+	Ok(())
+}
+
+async fn restore_mobile_devices_current_v47() -> anyhow::Result<()> {
+	let state = load_mobile_state_current_v47().await?;
+	for d in state.devices {
+		let key = match base64::engine::general_purpose::STANDARD.decode(d.public_key_b64.as_bytes()) {
+			Ok(k) if k.len() == 32 => k,
+			Ok(k) => {
+				log::warn!("[VSD2] saved Mobile {} has invalid key length {}", d.fingerprint, k.len());
+				continue;
+			}
+			Err(e) => {
+				log::warn!("[VSD2] cannot decode saved Mobile key {}: {}", d.fingerprint, e);
+				continue;
+			}
+		};
+		CLIENT_PUBLIC_KEYS.write().await.insert(d.fingerprint.clone(), key);
+		AUTHENTICATED_CLIENTS.write().await.insert(d.fingerprint.clone());
+		ensure_mobile_device(&d.fingerprint, &d.name, d.rows.max(1), d.columns.max(1)).await?;
+		log::info!(
+			"[VSD2] restored saved Mobile device id={} name={:?} layout={}x{}",
+			mobile_device_id(&d.fingerprint),
+			d.name,
+			d.rows,
+			d.columns
+		);
+	}
+	Ok(())
+}
+
+static MOBILE_IMAGE_CACHE: LazyLock<RwLock<HashMap<String, HashMap<u8, Option<String>>>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
+static KEYPAD_CONFIGS: LazyLock<RwLock<HashMap<String, KeypadConfig>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
+
 static AUTHENTICATED_CLIENTS: LazyLock<RwLock<std::collections::HashSet<String>>> = LazyLock::new(|| RwLock::new(std::collections::HashSet::new()));
+
+static CLIENT_SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 struct ClientHandle {
 	tx: mpsc::Sender<WsMessage>,
-<<<<<<< Updated upstream
-=======
 	session: u64,
 	encrypt: bool,
 }
@@ -105,7 +222,6 @@ async fn detach_mobile_session(device_id: &str, session: u64) {
 		clients.remove(device_id);
 		log::info!("[VSD2] detached icon session device={} session={}", device_id, session);
 	}
->>>>>>> Stashed changes
 }
 
 fn server_secret_key() -> SecretKey {
@@ -134,7 +250,19 @@ fn server_key() -> &'static [u8] {
 }
 
 fn hostname_string() -> String {
-	std::env::var("HOSTNAME").or_else(|_| std::env::var("COMPUTERNAME")).unwrap_or_else(|_| "OpenDeck".to_owned())
+	// Use the OS hostname for the name shown in Stream Deck Mobile's
+	// "Available computers" list. HOSTNAME may be overridden by a launcher.
+	if let Ok(hostname) = std::fs::read_to_string("/etc/hostname") {
+		let hostname = hostname.trim();
+		if !hostname.is_empty() {
+			return hostname.to_owned();
+		}
+	}
+	std::env::var("COMPUTERNAME")
+		.or_else(|_| std::env::var("HOSTNAME"))
+		.map(|name| name.trim().to_owned())
+		.and_then(|name| if name.is_empty() { Err(std::env::VarError::NotPresent) } else { Ok(name) })
+		.unwrap_or_else(|_| "OpenDeck".to_owned())
 }
 
 fn client_key_id(key: &[u8]) -> String {
@@ -185,17 +313,17 @@ pub struct PairingInfo {
 	pub public_key_fingerprint: String,
 }
 
-fn random_token() -> String {
-	use std::time::{SystemTime, UNIX_EPOCH};
-	let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-	let mut x = nanos ^ ((std::process::id() as u128) << 64);
+fn pairing_token() -> String {
+	let machine_id = std::fs::read_to_string("/etc/machine-id").unwrap_or_default();
+	let mut h = Blake2b512::new();
+	h.update(b"OpenDeck Stream Deck Mobile pairing token v1");
+	h.update(hostname_string().as_bytes());
+	h.update(machine_id.trim().as_bytes());
 	const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+	let digest = h.finalize();
 	let mut out = String::with_capacity(27);
-	for _ in 0..27 {
-		x ^= x << 13;
-		x ^= x >> 17;
-		x ^= x << 5;
-		out.push(ALPHABET[(x as usize) % ALPHABET.len()] as char);
+	for byte in digest.iter().cycle().take(27) {
+		out.push(ALPHABET[(*byte as usize) % ALPHABET.len()] as char);
 	}
 	out
 }
@@ -296,13 +424,13 @@ fn build_qr_data_url(payload: &str) -> Result<String, String> {
 pub fn pairing_info() -> Result<PairingInfo, String> {
 	let address = endpoint_addresses().into_iter().next().unwrap_or_else(|| "127.0.0.1".to_owned());
 	let ws = workstation_code();
-	let token = random_token();
+	let token = pairing_token();
 	let qr_url = format!(
 		"https://streamdeck.elgato.com/connect/?t={}&w={}&a={}:{}&av2={}:{}",
 		urlencoding::encode(&token),
 		urlencoding::encode(&ws),
 		address,
-		28197,
+		LEGACY_PORT,
 		address,
 		PORT,
 	);
@@ -313,7 +441,7 @@ pub fn pairing_info() -> Result<PairingInfo, String> {
 		qr_url,
 		qr_data_url,
 		address,
-		legacy_port: 28197,
+		legacy_port: LEGACY_PORT,
 		vsd2_port: PORT,
 		token,
 		workstation_id: ws,
@@ -334,16 +462,6 @@ pub async fn streamdeck_mobile_pending_pairings() -> Result<Vec<PendingPairing>,
 
 #[tauri::command]
 pub async fn streamdeck_mobile_resolve_pairing(fingerprint: String, approve: bool) -> Result<(), String> {
-<<<<<<< Updated upstream
-	let mut pending = PENDING_PAIRINGS.write().await;
-	if let Some(pairing) = pending.get_mut(&fingerprint) {
-		pairing.approved = approve;
-		log::info!("[VSD2] desktop pairing decision for {}: approve={}", fingerprint, approve);
-		Ok(())
-	} else {
-		Err(format!("No pending pairing for fingerprint {fingerprint}"))
-	}
-=======
 	mobile_debug_log(&format!("PAIRING_RESOLVE_BEGIN fingerprint={} approve={}", fingerprint, approve));
 	let public_key = CLIENT_PUBLIC_KEYS
 		.read()
@@ -461,7 +579,6 @@ pub async fn streamdeck_mobile_set_device_name(fingerprint: String, name: String
 	}
 	crate::events::frontend::update_devices().await;
 	Ok(())
->>>>>>> Stashed changes
 }
 
 /// Returns true when `device` belongs to this backend.
@@ -470,6 +587,10 @@ pub fn is_mobile_device(device: &str) -> bool {
 }
 
 pub async fn start() {
+	if let Err(error) = restore_mobile_devices_current_v47().await {
+		log::warn!("[VSD2] failed to restore saved Mobile devices: {}", error);
+	}
+
 	if STARTED.set(()).is_err() {
 		return;
 	}
@@ -486,31 +607,43 @@ pub async fn start() {
 }
 
 async fn run_server() -> anyhow::Result<()> {
-	let listener = TcpListener::bind(("0.0.0.0", PORT)).await?;
+	let listener_legacy = TcpListener::bind(("0.0.0.0", LEGACY_PORT)).await?;
+	let listener_v2 = TcpListener::bind(("0.0.0.0", PORT)).await?;
+
+	log::info!("Stream Deck Mobile legacy/session listener listening on 0.0.0.0:{LEGACY_PORT}");
 	log::info!("Stream Deck Mobile VSD2 server listening on 0.0.0.0:{PORT}");
 
 	loop {
-		let (stream, peer) = listener.accept().await?;
-		tokio::spawn(async move {
-			if let Err(error) = handle_client(stream, peer).await {
-				log::debug!("Stream Deck Mobile client {peer} disconnected: {error}");
+		tokio::select! {
+			result = listener_legacy.accept() => {
+				let (stream, peer) = result?;
+				log::info!("[VSD2] incoming Mobile legacy/session connection from {peer}");
+				tokio::spawn(async move {
+					if let Err(error) = handle_client(stream, peer, true).await {
+						log::debug!("Stream Deck Mobile legacy/session client {peer} disconnected: {error}");
+					}
+				});
 			}
-		});
+			result = listener_v2.accept() => {
+				let (stream, peer) = result?;
+				tokio::spawn(async move {
+					if let Err(error) = handle_client(stream, peer, false).await {
+						log::debug!("Stream Deck Mobile VSD2 client {peer} disconnected: {error}");
+					}
+				});
+			}
+		}
 	}
 }
 
-<<<<<<< Updated upstream
-async fn handle_client(stream: TcpStream, peer: SocketAddr) -> anyhow::Result<()> {
-=======
 async fn handle_client(stream: TcpStream, peer: SocketAddr, legacy_connection: bool) -> anyhow::Result<()> {
 	mobile_debug_log(&format!("WS_START peer={} legacy={}", peer, legacy_connection));
->>>>>>> Stashed changes
 	let websocket = tokio_tungstenite::accept_async(stream).await?;
 	log::info!("[VSD2] WebSocket handshake completed for {peer}");
 	mobile_debug_log(&format!("WS_HANDSHAKE peer={} legacy={}", peer, legacy_connection));
 
 	let (mut ws_write, mut ws_read) = websocket.split();
-	let (ws_tx, mut ws_rx) = mpsc::channel::<WsMessage>(64);
+	let (ws_tx, mut ws_rx) = mpsc::channel::<WsMessage>(256);
 
 	let writer = tokio::spawn(async move {
 		while let Some(message) = ws_rx.recv().await {
@@ -540,6 +673,7 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr, legacy_connection: b
 	let mut device_id: Option<String> = None;
 	let mut client_fingerprint: Option<String> = None;
 	let mut authenticated = false;
+	let mut attached_session: Option<(String, u64)> = None;
 
 	while let Some(message) = ws_read.next().await {
 		match message? {
@@ -596,8 +730,6 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr, legacy_connection: b
 															auth.request_id
 														);
 
-<<<<<<< Updated upstream
-=======
 														// The Mobile client is not supposed to perform a second
 														// approval step here. Desktop approval completes pairing,
 														// and OpenDeck should create the virtual Stream Deck now.
@@ -617,7 +749,6 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr, legacy_connection: b
 															send_virtual_device_list(&ws_tx, &cipher, &key_id).await?;
 														}
 
->>>>>>> Stashed changes
 														let response = ok(auth.request_id).encode_to_vec();
 														let nonce = SalsaBox::generate_nonce(&mut OsRng);
 														match boxed.encrypt(&nonce, response.as_slice()) {
@@ -639,7 +770,7 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr, legacy_connection: b
 														let mut pending = PENDING_PAIRINGS.write().await;
 														pending.entry(key_id.clone()).or_insert_with(|| PendingPairing {
 															fingerprint: key_id.clone(),
-															name: "Stream Deck Mobile".to_owned(),
+															name: CURRENT_V47_MOBILE_DEVICE_NAME.to_owned(),
 															peer: peer.to_string(),
 															approved: false,
 														});
@@ -668,6 +799,14 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr, legacy_connection: b
 														authenticated = true;
 														AUTHENTICATED_CLIENTS.write().await.insert(key_id.clone());
 
+														let approved_key = CLIENT_PUBLIC_KEYS
+															.read()
+															.await
+															.get(&key_id)
+															.cloned()
+															.ok_or_else(|| anyhow::anyhow!("No public key for approved Mobile {key_id}"))?;
+														persist_mobile_approval_current_v47(&key_id, &approved_key, DEFAULT_ROWS, DEFAULT_COLS).await?;
+
 														PENDING_PAIRINGS.write().await.remove(&key_id);
 
 														log::info!(
@@ -675,11 +814,8 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr, legacy_connection: b
 															key_id
 														);
 
-<<<<<<< Updated upstream
-=======
 														// Desktop approval establishes trust only. The runtime
 														// virtual Stream Deck is created by OpenVirtualDevice.
->>>>>>> Stashed changes
 														let response = ok(auth.request_id).encode_to_vec();
 														let nonce = SalsaBox::generate_nonce(&mut OsRng);
 														match boxed.encrypt(&nonce, response.as_slice()) {
@@ -697,7 +833,14 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr, legacy_connection: b
 																	frame_len,
 																	frame_prefix
 																);
-																log::info!("[VSD2] waiting for next ClientMessage after authentication on {peer}");
+
+																// Match the merged Codex VSD2 lifecycle:
+																// Authenticate -> OK -> encrypted VirtualDeviceList.
+																// Mobile then sends OpenVirtualDevice with the
+																// authoritative keypad_config/layout_crop.
+																send_virtual_device_list(&ws_tx, &boxed, &key_id).await?;
+
+																log::info!("[VSD2] QR pairing stage complete: encrypted VirtualDeviceList sent to {peer}; awaiting Mobile OpenVirtualDevice");
 															}
 															Err(_) => log::error!("[VSD2] failed to encrypt authentication OK for {peer}"),
 														}
@@ -736,8 +879,6 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr, legacy_connection: b
 														}
 													}
 												}
-<<<<<<< Updated upstream
-=======
 												Ok(ClientMessage {
 													payload: Some(client_message::Payload::OpenVirtualDevice(open)),
 												}) => {
@@ -891,9 +1032,8 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr, legacy_connection: b
 														log::debug!("[VSD2] dispatched encrypted KeyPress from {peer}: device={id} index={} pressed={}", key.index, key.pressed);
 													}
 												}
->>>>>>> Stashed changes
 												Ok(other) => {
-													log::warn!("[VSD2] decrypted non-Authenticate ClientMessage from {peer}: {:?}", other.payload);
+													log::debug!("[VSD2] decrypted VSD2 ClientMessage from {peer}: {:?}", other.payload);
 												}
 												Err(decode_error) => {
 													log::warn!("[VSD2] decrypted auth payload is not protobuf from {peer}: {decode_error}");
@@ -954,32 +1094,21 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr, legacy_connection: b
 
 						let already_authenticated = AUTHENTICATED_CLIENTS.read().await.contains(&key_id);
 						if already_authenticated {
-<<<<<<< Updated upstream
-							authenticated = true;
-							log::info!("[VSD2] known trusted Mobile {} connected on a new socket; advertising clientNeedsAuthentication=false", key_id);
-=======
 							PENDING_PAIRINGS.write().await.remove(&key_id);
 							log::info!("[VSD2] known trusted Mobile {} connected on discovery socket; advertising clientNeedsAuthentication=false", key_id);
 						} else {
 							let mobile_name = info.map(|i| i.name.as_str()).filter(|name| !name.is_empty()).unwrap_or(CURRENT_V47_MOBILE_DEVICE_NAME);
-							let mut pending = PENDING_PAIRINGS.write().await;
-							if let Some(entry) = pending.get_mut(&key_id) {
-								entry.name = mobile_name.to_owned();
-								entry.peer = peer.to_string();
-							} else {
-								pending.insert(
-									key_id.clone(),
-									PendingPairing {
-										fingerprint: key_id.clone(),
-										name: mobile_name.to_owned(),
-										peer: peer.to_string(),
-										approved: false,
-									},
-								);
-							}
+							PENDING_PAIRINGS.write().await.insert(
+								key_id.clone(),
+								PendingPairing {
+									fingerprint: key_id.clone(),
+									name: mobile_name.to_owned(),
+									peer: peer.to_string(),
+									approved: false,
+								},
+							);
 							log::info!("[VSD2] pending Mobile pairing candidate from Hello: fingerprint={} name={:?} peer={}", key_id, mobile_name, peer);
 							mobile_debug_log(&format!("PENDING_FROM_HELLO fingerprint={} name={:?} peer={}", key_id, mobile_name, peer));
->>>>>>> Stashed changes
 						}
 
 						// HelloFromServer is the per-connection capability/trust
@@ -1004,12 +1133,8 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr, legacy_connection: b
 							os_name: Some(std::env::consts::OS.to_owned()),
 							os_version: None,
 							endpoints: Some(ServiceEndpoints {
-<<<<<<< Updated upstream
-								addresses: vec![address],
-=======
 								addresses: vec![address.clone()],
 								// Direct VSD2 endpoint used by the Mobile computer list.
->>>>>>> Stashed changes
 								port: PORT as u32,
 							}),
 						};
@@ -1027,9 +1152,6 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr, legacy_connection: b
 							peer, key_id, !already_authenticated, address, PORT
 						));
 
-<<<<<<< Updated upstream
-						log::info!("[VSD2] HelloFromServer sent to {peer}; waiting for Mobile auth request");
-=======
 						log::info!("[VSD2] HelloFromServer sent to {peer}; discovery socket ready");
 
 						if already_authenticated {
@@ -1053,13 +1175,18 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr, legacy_connection: b
 								log::info!("[VSD2] TRUSTED_CURRENT_V47_LIST_SENT fingerprint={} mode=encrypted; awaiting Mobile OpenVirtualDevice", key_id);
 							}
 						} else {
-							// Do not send VirtualDeviceList before authentication.
-							// Stream Deck Mobile enters its authentication state from
-							// clientNeedsAuthentication=true and then sends Authenticate.
-							mobile_debug_log(&format!("UNTRUSTED_HELLO_WAIT_AUTH peer={} fingerprint={}", peer, key_id));
-							log::info!("[VSD2] untrusted Mobile {} waiting for Authenticate", key_id);
+							// The VSD2 client is expected to issue Authenticate after it
+							// receives HelloFromServer(clientNeedsAuthentication=true).
+							// Sending an empty list here is deliberately harmless (there
+							// are no resources to expose before authentication), but gives
+							// the Mobile state machine a complete discovery response.
+							let empty_list = ServerMessage {
+								payload: Some(server_message::Payload::VirtualDeviceList(VirtualDeviceList { devices: Vec::new() })),
+							};
+							ws_tx.send(WsMessage::Binary(empty_list.encode_to_vec().into())).await?;
+							mobile_debug_log(&format!("UNTRUSTED_VDL_TX peer={} fingerprint={} devices=0 awaiting Authenticate", peer, key_id));
+							log::info!("[VSD2] untrusted Mobile {} received empty VirtualDeviceList; awaiting Authenticate", key_id);
 						}
->>>>>>> Stashed changes
 					}
 
 					Some(client_message::Payload::Authenticate(auth)) => {
@@ -1071,20 +1198,18 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr, legacy_connection: b
 						// relevant. Discovery/Hello never creates a prompt.
 						{
 							let mut pending = PENDING_PAIRINGS.write().await;
-							pending.insert(
-								key_id.clone(),
-								PendingPairing {
-									fingerprint: key_id.clone(),
-									name: "Stream Deck Mobile".to_owned(),
-									peer: peer.to_string(),
-									approved: false,
-								},
-							);
+							let entry = pending.entry(key_id.clone()).or_insert_with(|| PendingPairing {
+								fingerprint: key_id.clone(),
+								name: CURRENT_V47_MOBILE_DEVICE_NAME.to_owned(),
+								peer: peer.to_string(),
+								approved: false,
+							});
+							entry.peer = peer.to_string();
 						}
 
 						log::info!("[VSD2] Authenticate received from {peer}: request_id={} verification_code={}", auth.request_id, key_id);
-						let approval_state = PENDING_PAIRINGS.read().await.get(&key_id).map(|p| p.approved).unwrap_or(false);
-						mobile_debug_log(&format!("AUTH_RX_APPROVAL_STATE fingerprint={} approved={}", key_id, approval_state));
+		let approval_state = PENDING_PAIRINGS.read().await.get(&key_id).map(|p| p.approved).unwrap_or(false);
+		mobile_debug_log(&format!("AUTH_RX_APPROVAL_STATE fingerprint={} approved={}", key_id, approval_state));
 
 						let approved = tokio::time::timeout(Duration::from_secs(60), async {
 							loop {
@@ -1108,8 +1233,6 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr, legacy_connection: b
 						}
 
 						authenticated = true;
-<<<<<<< Updated upstream
-=======
 						AUTHENTICATED_CLIENTS.write().await.insert(key_id.clone());
 
 						let public_key = CLIENT_PUBLIC_KEYS
@@ -1119,20 +1242,18 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr, legacy_connection: b
 							.cloned()
 							.ok_or_else(|| anyhow::anyhow!("No public key for approved Mobile {key_id}"))?;
 						persist_mobile_approval_current_v47(&key_id, &public_key, DEFAULT_ROWS, DEFAULT_COLS).await?;
->>>>>>> Stashed changes
 
 						ws_tx.send(WsMessage::Binary(ok(auth.request_id).encode_to_vec().into())).await?;
 
-						PENDING_PAIRINGS.write().await.remove(&key_id);
-<<<<<<< Updated upstream
+						let peer_key = PublicKey::from(<[u8; 32]>::try_from(public_key.as_slice()).map_err(|_| anyhow::anyhow!("Invalid Mobile public key"))?);
+						let cipher = SalsaBox::new(&peer_key, &server_secret_key());
+						send_virtual_device_list(&ws_tx, &cipher, &key_id).await?;
 
-						log::info!("[VSD2] Authenticate accepted from {peer}: request_id={}", auth.request_id);
-=======
+						PENDING_PAIRINGS.write().await.remove(&key_id);
 						log::info!(
 							"[VSD2] Authenticate accepted from {peer}: request_id={} trust persisted; encrypted VirtualDeviceList sent; awaiting OpenVirtualDevice",
 							auth.request_id
 						);
->>>>>>> Stashed changes
 					}
 
 					Some(client_message::Payload::CancelAuthenticate(cancel)) => {
@@ -1184,8 +1305,9 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr, legacy_connection: b
 						);
 
 						register_open_deck_device(&id, &create.name, (rows, columns)).await?;
-
-						CLIENTS.write().await.insert(id.clone(), ClientHandle { tx: ws_tx.clone() });
+						remember_keypad_config(&id, Some(&keypad)).await;
+						let session = attach_mobile_session(&id, ws_tx.clone(), false).await;
+						attached_session = Some((id.clone(), session));
 
 						let response = ServerMessage {
 							payload: Some(server_message::Payload::VirtualDeviceOpened(VirtualDeviceOpened {
@@ -1199,7 +1321,7 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr, legacy_connection: b
 
 						ws_tx.send(WsMessage::Binary(response.encode_to_vec().into())).await?;
 
-						send_context(&ws_tx, &keypad).await?;
+						send_context_plain(&ws_tx, &keypad).await?;
 
 						log::info!("[VSD2] virtual device ready: {} ({}x{})", id, rows, columns);
 					}
@@ -1213,27 +1335,39 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr, legacy_connection: b
 							.unwrap_or((DEFAULT_ROWS, DEFAULT_COLS));
 
 						log::info!(
-							"[VSD2] OpenVirtualDevice from {peer}: request_id={} device_id={} layout={}x{}",
+							"[VSD2] OpenVirtualDevice from {peer}: request_id={} device_id={} MOBILE_LAYOUT={}x{}",
 							open.request_id,
 							open.device_id,
 							rows,
 							columns
 						);
 
+						// Mobile owns the physical keypad geometry.
+						update_mobile_device_layout(&open.device_id, rows, columns).await?;
+
 						if !crate::shared::DEVICES.contains_key(&open.device_id) {
-							register_open_deck_device(&open.device_id, "Stream Deck Mobile", (rows, columns)).await?;
+							log::error!("[VSD2] OpenVirtualDevice register failed: id={} is not present in OpenDeck DEVICES", open.device_id);
+
+							let response = error_response(open.request_id, ErrorCode::DeviceNotFound, "Failed to register Stream Deck Mobile in OpenDeck");
+
+							ws_tx.send(WsMessage::Binary(response.encode_to_vec().into())).await?;
+							continue;
 						}
 
+						authenticated = true;
 						device_id = Some(open.device_id.clone());
+						remember_keypad_config(&open.device_id, open.keypad_config.as_ref()).await;
+						let session = attach_mobile_session(&open.device_id, ws_tx.clone(), false).await;
+						attached_session = Some((open.device_id.clone(), session));
 
-						CLIENTS.write().await.insert(open.device_id.clone(), ClientHandle { tx: ws_tx.clone() });
+						log::info!("[VSD2] OpenVirtualDevice attached to OpenDeck device {} (MOBILE_LAYOUT={}x{})", open.device_id, rows, columns);
 
 						let response = ServerMessage {
 							payload: Some(server_message::Payload::VirtualDeviceOpened(VirtualDeviceOpened {
 								request_id: open.request_id,
 								device: Some(VirtualDevice {
 									id: open.device_id.clone(),
-									name: "Stream Deck Mobile".to_owned(),
+									name: CURRENT_V47_MOBILE_DEVICE_NAME.to_owned(),
 								}),
 							})),
 						};
@@ -1241,15 +1375,22 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr, legacy_connection: b
 						ws_tx.send(WsMessage::Binary(response.encode_to_vec().into())).await?;
 
 						if let Some(cfg) = open.keypad_config.as_ref() {
-							send_context(&ws_tx, cfg).await?;
+							send_context_plain(&ws_tx, cfg).await?;
 						}
+
+						replay_cached_mobile_images(&open.device_id).await?;
+						request_mobile_icon_refresh().await;
 					}
 
 					Some(client_message::Payload::DeleteVirtualDevice(delete)) => {
 						log::info!("[VSD2] DeleteVirtualDevice from {peer}: request_id={}", delete.request_id);
 
 						if let Some(id) = device_id.as_ref() {
-							CLIENTS.write().await.remove(id);
+							if let Some((attached_id, session)) = attached_session.take() {
+								if attached_id == *id {
+									detach_mobile_session(&attached_id, session).await;
+								}
+							}
 							deregister_open_deck_device(id).await;
 						}
 
@@ -1264,11 +1405,21 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr, legacy_connection: b
 							update.pressed_icon_size.as_ref().map(|s| (s.width, s.height)),
 							update.layout_crop.as_ref().map(|s| (s.width, s.height))
 						);
+
+						if let Some(id) = device_id.as_ref() {
+							apply_keypad_update(id, &update).await;
+							if let Some(size) = update.layout_crop.as_ref() {
+								let rows = size.height.clamp(1, 255) as u8;
+								let columns = size.width.clamp(1, 255) as u8;
+								update_mobile_device_layout(id, rows, columns).await?;
+							}
+						}
 					}
 
 					Some(client_message::Payload::KeyPress(key)) => {
 						if let Some(id) = device_id.as_ref() {
 							log::info!("[VSD2] KeyPress from {peer}: device={} index={} pressed={}", id, key.index, key.pressed);
+							dispatch_mobile_keypress(id, key.index, key.pressed).await;
 						}
 					}
 
@@ -1319,9 +1470,9 @@ async fn handle_client(stream: TcpStream, peer: SocketAddr, legacy_connection: b
 		log::debug!("[VSD2] preserving Mobile public-key identity {} after socket disconnect", key_id);
 	}
 
-	if let Some(id) = device_id {
-		CLIENTS.write().await.remove(&id);
-		log::info!("[VSD2] detached device {id} from {peer}");
+	if let Some((id, session)) = attached_session.take() {
+		detach_mobile_session(&id, session).await;
+		log::info!("[VSD2] active Mobile session closed for {peer}; device remains registered");
 	}
 
 	drop(ws_tx);
@@ -1357,8 +1508,6 @@ fn error_response(request_id: u32, code: ErrorCode, reason: &str) -> ServerMessa
 	}
 }
 
-<<<<<<< Updated upstream
-=======
 fn mobile_device_id(fingerprint: &str) -> String {
 	format!("sdm-{fingerprint}")
 }
@@ -1458,7 +1607,6 @@ async fn update_mobile_device_layout(device_id: &str, rows: u8, columns: u8) -> 
 	register_open_deck_device(device_id, &name, (rows, columns)).await
 }
 
->>>>>>> Stashed changes
 async fn register_open_deck_device(device_id: &str, name: &str, (rows, columns): (u8, u8)) -> anyhow::Result<()> {
 	if crate::shared::DEVICES.contains_key(device_id) {
 		return Ok(());
@@ -1487,7 +1635,31 @@ async fn deregister_open_deck_device(device_id: &str) {
 	let _ = crate::events::inbound::devices::deregister_device("", crate::events::inbound::PayloadEvent { payload: device_id.to_owned() }).await;
 }
 
-async fn send_context(tx: &mpsc::Sender<WsMessage>, keypad: &KeypadConfig) -> anyhow::Result<()> {
+async fn send_context_plain(tx: &mpsc::Sender<WsMessage>, keypad: &KeypadConfig) -> anyhow::Result<()> {
+	let rows = keypad.layout_crop.as_ref().map(|size| size.height).unwrap_or(DEFAULT_ROWS as u32);
+	let columns = keypad.layout_crop.as_ref().map(|size| size.width).unwrap_or(DEFAULT_COLS as u32);
+
+	let message = ServerMessage {
+		payload: Some(server_message::Payload::Context(Context {
+			profile_id: "opendeck-mobile-profile".to_owned(),
+			total_pages: 1,
+			current_page: 0,
+			actions: (0..rows.saturating_mul(columns))
+				.map(|index| Action {
+					index,
+					title: String::new(),
+					name: String::new(),
+					category: String::new(),
+					shortcut_id: None,
+				})
+				.collect(),
+		})),
+	};
+	tx.send(WsMessage::Binary(message.encode_to_vec().into())).await?;
+	Ok(())
+}
+
+async fn send_context(tx: &mpsc::Sender<WsMessage>, cipher: &SalsaBox, keypad: &KeypadConfig) -> anyhow::Result<()> {
 	let (rows, columns) = keypad
 		.layout_crop
 		.as_ref()
@@ -1513,51 +1685,131 @@ async fn send_context(tx: &mpsc::Sender<WsMessage>, keypad: &KeypadConfig) -> an
 		})),
 	};
 
-	tx.send(WsMessage::Binary(message.encode_to_vec().into())).await?;
+	send_encrypted(tx, cipher, message).await?;
 	Ok(())
 }
 
+async fn remember_keypad_config(device_id: &str, config: Option<&KeypadConfig>) {
+	if let Some(config) = config {
+		KEYPAD_CONFIGS.write().await.insert(device_id.to_owned(), config.clone());
+		log::info!(
+			"[VSD2] keypad config for {}: icon_size={:?} formats={:?} high_dpi={}",
+			device_id,
+			config.icon_size.as_ref().map(|size| (size.width, size.height)),
+			config.supported_icon_image_formats,
+			config.high_dpi
+		);
+	}
+}
+
+async fn apply_keypad_update(device_id: &str, update: &UpdateKeypadConfig) {
+	let mut configs = KEYPAD_CONFIGS.write().await;
+	let config = configs.entry(device_id.to_owned()).or_insert_with(|| KeypadConfig {
+		supported_icon_image_formats: vec![ImageFormat::Jpg as i32, ImageFormat::Png as i32],
+		icon_size: Some(Size { width: 144, height: 144 }),
+		pressed_icon_size: None,
+		high_dpi: true,
+		overscale: true,
+		layout_crop: None,
+		enable_context_api: true,
+	});
+	if update.icon_size.is_some() {
+		config.icon_size = update.icon_size.clone();
+	}
+	if update.pressed_icon_size.is_some() {
+		config.pressed_icon_size = update.pressed_icon_size.clone();
+	}
+	if let Some(high_dpi) = update.high_dpi {
+		config.high_dpi = high_dpi;
+	}
+	if update.layout_crop.is_some() {
+		config.layout_crop = update.layout_crop.clone();
+	}
+}
+
+async fn request_mobile_icon_refresh() {
+	if let Some(app) = crate::APP_HANDLE.get() {
+		if let Err(error) = crate::events::frontend::profiles::rerender_images(app).await {
+			log::debug!("[VSD2] could not request frontend icon refresh: {error}");
+		}
+	}
+}
+
+async fn dispatch_mobile_keypress(device_id: &str, index: u32, pressed: bool) {
+	let Some(device) = crate::shared::DEVICES.get(device_id) else {
+		log::warn!("[VSD2] ignoring KeyPress for unavailable device {device_id}");
+		return;
+	};
+	let key_count = u32::from(device.rows) * u32::from(device.columns);
+	drop(device);
+
+	if index >= key_count || index > u32::from(u8::MAX) {
+		log::warn!("[VSD2] ignoring out-of-range KeyPress device={device_id} index={index} key_count={key_count}");
+		return;
+	}
+
+	let event = crate::events::inbound::PayloadEvent {
+		payload: crate::events::inbound::devices::PressPayload {
+			device: device_id.to_owned(),
+			position: index as u8,
+		},
+	};
+	let result = if pressed {
+		crate::events::inbound::devices::key_down(event).await
+	} else {
+		crate::events::inbound::devices::key_up(event).await
+	};
+	if let Err(error) = result {
+		log::warn!("[VSD2] failed to dispatch KeyPress device={device_id}: {error}");
+	}
+}
+
 /// Push an OpenDeck image to a connected Mobile client. Returns true when handled.
+async fn mobile_session_cipher(device_id: &str) -> anyhow::Result<SalsaBox> {
+	let fingerprint = device_id.strip_prefix("sdm-").ok_or_else(|| anyhow::anyhow!("invalid Mobile device id: {device_id}"))?;
+
+	let public_key = CLIENT_PUBLIC_KEYS
+		.read()
+		.await
+		.get(fingerprint)
+		.cloned()
+		.ok_or_else(|| anyhow::anyhow!("no Mobile public key for {fingerprint}"))?;
+
+	let peer_key = PublicKey::from(<[u8; 32]>::try_from(public_key.as_slice()).map_err(|_| anyhow::anyhow!("invalid Mobile public key"))?);
+
+	Ok(SalsaBox::new(&peer_key, &server_secret_key()))
+}
+
+async fn replay_cached_mobile_images(device_id: &str) -> anyhow::Result<()> {
+	let cached = MOBILE_IMAGE_CACHE.read().await.get(device_id).cloned();
+	let Some(cached) = cached else {
+		return Ok(());
+	};
+
+	let count = cached.len();
+	for (position, data_url) in cached {
+		update_image(device_id, position, data_url.as_deref()).await?;
+	}
+	log::info!("[VSD2] replayed {} cached Mobile icons after session attach: device={}", count, device_id);
+	Ok(())
+}
+
 pub async fn update_image(device_id: &str, position: u8, data_url: Option<&str>) -> anyhow::Result<bool> {
 	if !is_mobile_device(device_id) {
 		return Ok(false);
 	}
+	MOBILE_IMAGE_CACHE
+		.write()
+		.await
+		.entry(device_id.to_owned())
+		.or_default()
+		.insert(position, data_url.map(|value| value.to_owned()));
 	let client = CLIENTS.read().await.get(device_id).cloned();
 	let Some(client) = client else {
+		log::debug!("[VSD2] cached Mobile icon device={} index={} (no icon session yet)", device_id, position);
 		return Ok(true);
 	};
 
-<<<<<<< Updated upstream
-	let image = if let Some(data_url) = data_url {
-		let Some((_, encoded)) = data_url.split_once(',') else {
-			return Ok(true);
-		};
-		let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
-		let img = image::load_from_memory(&bytes)?;
-		let rgba = img.to_rgba8();
-		let (width, height) = rgba.dimensions();
-		let mut out = Vec::with_capacity((width * height * 4) as usize);
-		image::codecs::png::PngEncoder::new(&mut out).write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)?;
-		Image {
-			format: ImageFormat::Png as i32,
-			r#type: ImageType::Transparent as i32,
-			size: Some(Size { width, height }),
-			row_bytes: width * 4,
-			image: out,
-		}
-	} else {
-		empty_png()?
-	};
-
-	let message = ServerMessage {
-		payload: Some(server_message::Payload::Icon(Icon {
-			index: position as u32,
-			image: Some(image),
-		})),
-	};
-	client.tx.send(WsMessage::Binary(message.encode_to_vec().into())).await?;
-	Ok(true)
-=======
 	let keypad = KEYPAD_CONFIGS.read().await.get(device_id).cloned();
 	let image = encode_mobile_icon(data_url, keypad.as_ref())?;
 	send_icon_message(device_id, &client, position as u32, image).await?;
@@ -1654,7 +1906,6 @@ fn encode_mobile_icon(data_url: Option<&str>, keypad: Option<&KeypadConfig>) -> 
 		}
 		_ => anyhow::bail!("unsupported Mobile image format {:?}", format),
 	}
->>>>>>> Stashed changes
 }
 
 pub async fn clear_screen(device_id: &str) -> bool {
@@ -1666,7 +1917,8 @@ pub async fn clear_screen(device_id: &str) -> bool {
 		return true;
 	};
 
-	let blank = empty_png().ok();
+	let keypad = KEYPAD_CONFIGS.read().await.get(device_id).cloned();
+	let blank = encode_mobile_icon(None, keypad.as_ref()).ok();
 	let count = crate::shared::DEVICES
 		.get(device_id)
 		.map(|device| device.rows as u32 * device.columns as u32)
@@ -1674,29 +1926,12 @@ pub async fn clear_screen(device_id: &str) -> bool {
 
 	for index in 0..count {
 		if let Some(image) = blank.clone() {
-			let message = ServerMessage {
-				payload: Some(server_message::Payload::Icon(Icon { index, image: Some(image) })),
-			};
-			let _ = client.tx.send(WsMessage::Binary(message.encode_to_vec().into())).await;
+			let _ = send_icon_message(device_id, &client, index, image).await;
 		}
 	}
 	true
 }
 
-<<<<<<< Updated upstream
-fn empty_png() -> anyhow::Result<Image> {
-	let rgba = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 0]));
-	let (width, height) = rgba.dimensions();
-	let mut out = Vec::new();
-	image::codecs::png::PngEncoder::new(&mut out).write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)?;
-	Ok(Image {
-		format: ImageFormat::Png as i32,
-		r#type: ImageType::Transparent as i32,
-		size: Some(Size { width, height }),
-		row_bytes: width * 4,
-		image: out,
-	})
-=======
 fn empty_icon_for_format(target: (u32, u32), format: ImageFormat) -> anyhow::Result<Image> {
 	match format {
 		ImageFormat::Lz4 | ImageFormat::Lzf | ImageFormat::Lzfse => {
@@ -1737,7 +1972,6 @@ fn empty_icon_for_format(target: (u32, u32), format: ImageFormat) -> anyhow::Res
 		}
 		_ => anyhow::bail!("unsupported Mobile image format {:?}", format),
 	}
->>>>>>> Stashed changes
 }
 
 async fn run_mdns_announcer() {
@@ -1746,8 +1980,6 @@ async fn run_mdns_announcer() {
 		return;
 	};
 
-<<<<<<< Updated upstream
-=======
 	let hostname = hostname_string();
 	let workstation = workstation_code();
 	let discovery_id = discovery_service_id();
@@ -1800,7 +2032,6 @@ async fn run_mdns_announcer() {
 		}
 	}
 
->>>>>>> Stashed changes
 	let socket = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
 		Ok(socket) => socket,
 		Err(error) => {
@@ -1812,45 +2043,41 @@ async fn run_mdns_announcer() {
 	let _ = socket.set_multicast_loop_v4(true);
 	mobile_debug_log(&format!("MDNS_RAW_SOCKET_READY ip={} multicast=224.0.0.251:5353", ip));
 
-	let instance = format!("OpenDeck-{}", workstation_code());
-	let host = format!("opendeck-{}.local.", hex6(server_key()));
+	let instance = hostname.clone();
+	let host = format!("{}.local.", hostname.to_lowercase().replace(' ', "-"));
 	let service = format!("{}.{}", instance, SERVICE_TYPE);
 
 	log::info!(
-		"[VSD2] mDNS advertising ONE service: instance={} service={} host={} id={} port={}",
+		"[VSD2] mDNS advertising service: instance={} service={} host={} id={} port={}",
 		instance,
 		service,
 		host,
-		workstation_code(),
-		PORT
+		workstation,
+		LEGACY_PORT
 	);
 
-	let hostname = hostname_string();
-	for legacy_instance in [format!("OpenDeck {}", hostname), format!("OpenDeck-{}", hostname), "OpenDeck".to_owned()] {
+	for legacy_instance in [
+		format!("{}-{}", hostname, workstation),
+		format!("OpenDeck {}", hostname),
+		format!("OpenDeck-{}", hostname),
+		"OpenDeck".to_owned(),
+	] {
 		if legacy_instance == instance {
 			continue;
 		}
 		let legacy_service = format!("{}.{}", legacy_instance, SERVICE_TYPE);
-		let goodbye = build_mdns_goodbye(&legacy_service, &host, ip, PORT);
+		let goodbye = build_mdns_goodbye(&legacy_service, &host, ip, LEGACY_PORT);
 		for _ in 0..3 {
 			let _ = socket.send_to(&goodbye, (Ipv4Addr::new(224, 0, 0, 251), 5353));
 		}
 	}
 
-	let packet = build_mdns_response(&service, &host, &instance, ip, PORT);
-	log::debug!("[VSD2] mDNS current PTR target = {}; no additional service instances are generated by this process", service);
-	let _ = socket.send_to(&packet, (Ipv4Addr::new(224, 0, 0, 251), 5353));
 	loop {
-<<<<<<< Updated upstream
-		let packet = build_mdns_response(&service, &host, &instance, ip, PORT);
-		let _ = socket.send_to(&packet, (Ipv4Addr::new(224, 0, 0, 251), 5353));
-=======
 		let packet = build_mdns_response(&service, &host, &instance, ip, LEGACY_PORT);
 		match socket.send_to(&packet, (Ipv4Addr::new(224, 0, 0, 251), 5353)) {
 			Ok(bytes) => mobile_debug_log(&format!("MDNS_RAW_SENT bytes={} service={} ip={} port={}", bytes, service, ip, LEGACY_PORT)),
 			Err(error) => mobile_debug_log(&format!("MDNS_RAW_SEND_FAILED error={} service={} ip={}", error, service, ip)),
 		}
->>>>>>> Stashed changes
 		tokio::time::sleep(Duration::from_secs(10)).await;
 	}
 }
@@ -1952,16 +2179,6 @@ fn build_mdns_response(service: &str, host: &str, instance: &str, ip: Ipv4Addr, 
 	out.extend_from_slice(&0x8001u16.to_be_bytes());
 	out.extend_from_slice(&30u32.to_be_bytes());
 
-<<<<<<< Updated upstream
-	let txt1 = format!("id={}", workstation_code());
-	let txt2 = "name=OpenDeck";
-	let txt_len = 1 + txt1.len() + 1 + txt2.len();
-	out.extend_from_slice(&(txt_len as u16).to_be_bytes());
-	out.push(txt1.len() as u8);
-	out.extend_from_slice(txt1.as_bytes());
-	out.push(txt2.len() as u8);
-	out.extend_from_slice(txt2.as_bytes());
-=======
 	let txt_items = [
 		format!("id={}", discovery_service_id()),
 		format!("name={}", hostname_string()),
@@ -1980,7 +2197,6 @@ fn build_mdns_response(service: &str, host: &str, instance: &str, ip: Ipv4Addr, 
 
 	out.extend_from_slice(&(txt.len() as u16).to_be_bytes());
 	out.extend_from_slice(&txt);
->>>>>>> Stashed changes
 
 	// A record.
 	dns_name(host, &mut out);

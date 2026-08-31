@@ -165,7 +165,7 @@
 				class="px-3 py-1 text-sm text-neutral-300 bg-neutral-700 hover:bg-neutral-600 transition-colors border border-neutral-600 rounded-lg"
 				on:click={() => (showMobilePairing = true)}
 			>
-				Add Stream Deck Mobile
+				Stream Deck Mobile Management
 			</button>
 		</div>
 

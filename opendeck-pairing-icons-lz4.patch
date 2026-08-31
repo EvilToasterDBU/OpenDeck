@@ -1,0 +1,174 @@
+--- src-tauri/Cargo.toml	2026-08-30 06:17:10.599816082 +0000
++++ /tmp/Cargo.toml	2026-08-30 06:34:32.419271142 +0000
+@@ -46,6 +46,7 @@
+ os_info = "3.14"
+ urlencoding = "2.1"
+ base64 = "0.22"
++lz4_flex = "0.11"
+ qrcodegen = "1.8"
+ prost = "0.14"
+ blake2 = "0.10"
+--- src-tauri/src/streamdeck_mobile.rs	2026-08-30 06:18:57.192509519 +0000
++++ /tmp/sdm.rs	2026-08-30 06:34:32.418212243 +0000
+@@ -971,7 +971,26 @@
+ 
+ 						let already_authenticated = AUTHENTICATED_CLIENTS.read().await.contains(&key_id);
+ 
++						if !already_authenticated {
++							let pending_name = info
++								.and_then(|i| {
++									let name = i.name.trim();
++									if name.is_empty() { None } else { Some(name.to_owned()) }
++								})
++								.unwrap_or_else(|| key_id.clone());
++							let mut pending = PENDING_PAIRINGS.write().await;
++							let entry = pending.entry(key_id.clone()).or_insert_with(|| PendingPairing {
++								fingerprint: key_id.clone(),
++								name: pending_name.clone(),
++								peer: peer.to_string(),
++								approved: false,
++							});
++							entry.name = pending_name;
++							entry.peer = peer.to_string();
++						}
++
+ 						if already_authenticated {
++							PENDING_PAIRINGS.write().await.remove(&key_id);
+ 							authenticated = true;
+ 
+ 							let trusted_id = ensure_mobile_device(&key_id, CURRENT_V47_MOBILE_DEVICE_NAME, DEFAULT_ROWS, DEFAULT_COLS).await?;
+@@ -1721,55 +1740,40 @@
+ 	Ok(())
+ }
+ 
+-fn encode_mobile_icon(data_url: Option<&str>, keypad: Option<&KeypadConfig>) -> anyhow::Result<Image> {
+-	let target = keypad
+-		.and_then(|config| config.icon_size.as_ref())
+-		.map(|size| (size.width.max(1), size.height.max(1)))
+-		.unwrap_or((144, 144));
+-	let prefer_jpeg = keypad
+-		.map(|config| {
+-			if config.supported_icon_image_formats.is_empty() {
+-				true
+-			} else {
+-				config.supported_icon_image_formats.contains(&(ImageFormat::Jpg as i32)) || !config.supported_icon_image_formats.contains(&(ImageFormat::Png as i32))
+-			}
+-		})
+-		.unwrap_or(true);
++fn preferred_mobile_image_format(keypad: Option<&KeypadConfig>) -> ImageFormat {
++	let supported = keypad.map(|config| config.supported_icon_image_formats.as_slice()).unwrap_or(&[]);
++	if supported.is_empty() { return ImageFormat::Lz4; }
++	for format in [ImageFormat::Lz4, ImageFormat::Lzf, ImageFormat::Lzfse, ImageFormat::Png, ImageFormat::Jpg] {
++		if supported.contains(&(format as i32)) { return format; }
++	}
++	ImageFormat::Png
++}
+ 
+-	let Some(data_url) = data_url else {
+-		return empty_icon(target, prefer_jpeg);
+-	};
+-	let Some((_, encoded)) = data_url.split_once(',') else {
+-		return empty_icon(target, prefer_jpeg);
+-	};
++fn encode_mobile_icon(data_url: Option<&str>, keypad: Option<&KeypadConfig>) -> anyhow::Result<Image> {
++	let target = keypad.and_then(|config| config.icon_size.as_ref()).map(|size| (size.width.max(1), size.height.max(1))).unwrap_or((144, 144));
++	let format = preferred_mobile_image_format(keypad);
++	let Some(data_url) = data_url else { return empty_icon_for_format(target, format); };
++	let Some((_, encoded)) = data_url.split_once(',') else { return empty_icon_for_format(target, format); };
+ 	let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+ 	let img = image::load_from_memory(&bytes)?;
+ 	let resized = img.resize_exact(target.0, target.1, image::imageops::FilterType::Lanczos3);
+-
+-	if prefer_jpeg {
+-		let rgb = resized.to_rgb8();
+-		let (width, height) = rgb.dimensions();
+-		let mut out = Vec::new();
+-		image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90).write_image(&rgb, width, height, image::ExtendedColorType::Rgb8)?;
+-		Ok(Image {
+-			format: ImageFormat::Jpg as i32,
+-			r#type: ImageType::Opaque as i32,
+-			size: Some(Size { width, height }),
+-			row_bytes: width * 3,
+-			image: out,
+-		})
+-	} else {
+-		let rgba = resized.to_rgba8();
+-		let (width, height) = rgba.dimensions();
+-		let mut out = Vec::new();
+-		image::codecs::png::PngEncoder::new(&mut out).write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)?;
+-		Ok(Image {
+-			format: ImageFormat::Png as i32,
+-			r#type: ImageType::Transparent as i32,
+-			size: Some(Size { width, height }),
+-			row_bytes: width * 4,
+-			image: out,
+-		})
++	let (width, height) = resized.dimensions();
++	match format {
++		ImageFormat::Lz4 | ImageFormat::Lzf | ImageFormat::Lzfse => {
++			let rgba = resized.to_rgba8();
++			Ok(Image { format: ImageFormat::Lz4 as i32, r#type: ImageType::Transparent as i32, size: Some(Size { width, height }), row_bytes: width * 4, image: lz4_flex::block::compress(rgba.as_raw()) })
++		}
++		ImageFormat::Jpg => {
++			let rgb = resized.to_rgb8(); let mut out = Vec::new();
++			image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90).write_image(&rgb, width, height, image::ExtendedColorType::Rgb8)?;
++			Ok(Image { format: ImageFormat::Jpg as i32, r#type: ImageType::Opaque as i32, size: Some(Size { width, height }), row_bytes: width * 3, image: out })
++		}
++		ImageFormat::Png => {
++			let rgba = resized.to_rgba8(); let mut out = Vec::new();
++			image::codecs::png::PngEncoder::new(&mut out).write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)?;
++			Ok(Image { format: ImageFormat::Png as i32, r#type: ImageType::Transparent as i32, size: Some(Size { width, height }), row_bytes: width * 4, image: out })
++		}
++		_ => anyhow::bail!("unsupported Mobile image format {:?}", format),
+ 	}
+ }
+ 
+@@ -1797,31 +1801,23 @@
+ 	true
+ }
+ 
+-fn empty_icon(target: (u32, u32), jpeg: bool) -> anyhow::Result<Image> {
+-	if jpeg {
+-		let rgb = image::RgbImage::from_pixel(target.0.max(2), target.1.max(2), image::Rgb([0, 0, 0]));
+-		let (width, height) = rgb.dimensions();
+-		let mut out = Vec::new();
+-		image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 80).write_image(&rgb, width, height, image::ExtendedColorType::Rgb8)?;
+-		Ok(Image {
+-			format: ImageFormat::Jpg as i32,
+-			r#type: ImageType::Opaque as i32,
+-			size: Some(Size { width, height }),
+-			row_bytes: width * 3,
+-			image: out,
+-		})
+-	} else {
+-		let rgba = image::RgbaImage::from_pixel(target.0.max(2), target.1.max(2), image::Rgba([0, 0, 0, 0]));
+-		let (width, height) = rgba.dimensions();
+-		let mut out = Vec::new();
+-		image::codecs::png::PngEncoder::new(&mut out).write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)?;
+-		Ok(Image {
+-			format: ImageFormat::Png as i32,
+-			r#type: ImageType::Transparent as i32,
+-			size: Some(Size { width, height }),
+-			row_bytes: width * 4,
+-			image: out,
+-		})
++fn empty_icon_for_format(target: (u32, u32), format: ImageFormat) -> anyhow::Result<Image> {
++	match format {
++		ImageFormat::Lz4 | ImageFormat::Lzf | ImageFormat::Lzfse => {
++			let raw = vec![0u8; target.0 as usize * target.1 as usize * 4];
++			Ok(Image { format: ImageFormat::Lz4 as i32, r#type: ImageType::Transparent as i32, size: Some(Size { width: target.0, height: target.1 }), row_bytes: target.0 * 4, image: lz4_flex::block::compress(&raw) })
++		}
++		ImageFormat::Jpg => {
++			let rgb = image::RgbImage::from_pixel(target.0.max(2), target.1.max(2), image::Rgb([0,0,0])); let (width,height)=rgb.dimensions(); let mut out=Vec::new();
++			image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out,80).write_image(&rgb,width,height,image::ExtendedColorType::Rgb8)?;
++			Ok(Image { format: ImageFormat::Jpg as i32, r#type: ImageType::Opaque as i32, size: Some(Size { width,height }), row_bytes: width*3, image: out })
++		}
++		ImageFormat::Png => {
++			let rgba = image::RgbaImage::from_pixel(target.0.max(2), target.1.max(2), image::Rgba([0,0,0,0])); let (width,height)=rgba.dimensions(); let mut out=Vec::new();
++			image::codecs::png::PngEncoder::new(&mut out).write_image(&rgba,width,height,image::ExtendedColorType::Rgba8)?;
++			Ok(Image { format: ImageFormat::Png as i32, r#type: ImageType::Transparent as i32, size: Some(Size { width,height }), row_bytes: width*4, image: out })
++		}
++		_ => anyhow::bail!("unsupported Mobile image format {:?}", format),
+ 	}
+ }
+ 

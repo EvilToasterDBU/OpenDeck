@@ -110,6 +110,14 @@ async fn main() {
 			streamdeck_mobile::streamdeck_mobile_pairing_info,
 			streamdeck_mobile::streamdeck_mobile_pending_pairings,
 			streamdeck_mobile::streamdeck_mobile_resolve_pairing,
+<<<<<<< Updated upstream
+			streamdeck_mobile::streamdeck_mobile_pending_pairings,
+			streamdeck_mobile::streamdeck_mobile_resolve_pairing,
+=======
+			streamdeck_mobile::streamdeck_mobile_saved_devices,
+			streamdeck_mobile::streamdeck_mobile_set_device_name,
+			streamdeck_mobile::streamdeck_mobile_remove_device,
+>>>>>>> Stashed changes
 		])
 		.setup(|app| {
 			APP_HANDLE.set(app.handle().clone()).unwrap();

@@ -47,6 +47,39 @@
 		}
 	}
 
+<<<<<<< Updated upstream
+=======
+	async function loadSavedDevices() {
+		try {
+			savedDevices = await invoke<SavedMobileDevice[]>("streamdeck_mobile_saved_devices");
+		} catch (e) {
+			console.warn("Failed to load saved Mobile devices", e);
+		}
+	}
+
+	async function removeSavedDevice(device: SavedMobileDevice) {
+		try {
+			await invoke("streamdeck_mobile_remove_device", { fingerprint: device.fingerprint });
+			savedDevices = savedDevices.filter((item) => item.fingerprint !== device.fingerprint);
+		} catch (e) {
+			error = String(e);
+		}
+	}
+
+	async function renameSavedDevice(device: SavedMobileDevice, value: string) {
+		try {
+			await invoke("streamdeck_mobile_set_device_name", {
+				fingerprint: device.fingerprint,
+				name: value
+			});
+			device.name = value;
+			savedDevices = savedDevices;
+		} catch (e) {
+			error = String(e);
+		}
+	}
+
+>>>>>>> Stashed changes
 	async function poll() {
 		try {
 			pending = await invoke<PendingPairing[]>("streamdeck_mobile_pending_pairings");
@@ -83,13 +116,42 @@
 	}
 </script>
 
-<Popup show={show || pending.length > 0} label="Add Stream Deck Mobile">
+<Popup {show} label="Stream Deck Mobile Management">
 	<svelte:fragment slot="header">
 		<button class="mr-2 my-1 float-right text-xl text-neutral-300" on:click={() => (show = false)} aria-label="Close">✕</button>
-		<h2 class="m-2 font-semibold text-xl text-neutral-300">Add Stream Deck Mobile</h2>
+		<h2 class="m-2 font-semibold text-xl text-neutral-300">Stream Deck Mobile Management</h2>
 	</svelte:fragment>
 
 	<div class="flex flex-col items-center p-4 min-w-[500px]">
+<<<<<<< Updated upstream
+=======
+		{#if savedDevices.length > 0}
+			<div class="w-full max-w-[460px] mb-4 rounded-xl border border-neutral-700 bg-neutral-800 p-4">
+				<div class="text-sm font-semibold text-neutral-100 mb-3">Saved Stream Deck Mobile</div>
+				{#each savedDevices as device}
+					<div class="mb-3 last:mb-0">
+						<div class="flex items-center gap-2">
+							<input
+								class="flex-1 px-3 py-2 rounded-lg bg-neutral-900 border border-neutral-700 text-neutral-100"
+								value={device.name}
+							on:change={(e) => renameSavedDevice(device, e.currentTarget.value)}
+							/>
+							<span class="text-xs text-neutral-500 font-mono">{device.rows}x{device.columns}</span>
+							<button
+								class="px-2.5 py-2 rounded-lg bg-red-700 hover:bg-red-600 text-white text-sm"
+								on:click={() => removeSavedDevice(device)}
+								aria-label={`Remove ${device.name}`}
+							>
+								Delete
+							</button>
+						</div>
+						<div class="mt-1 text-[10px] text-neutral-500 font-mono">{device.fingerprint}</div>
+					</div>
+				{/each}
+			</div>
+		{/if}
+
+>>>>>>> Stashed changes
 		{#if pending.length > 0}
 			{#each pending as pair}
 				<div class="w-full max-w-[460px] rounded-xl border border-blue-500/40 bg-neutral-800 p-4">

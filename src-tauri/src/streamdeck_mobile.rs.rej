@@ -1,0 +1,32 @@
+--- src-tauri/src/streamdeck_mobile.rs
++++ src-tauri/src/streamdeck_mobile.rs
+@@ -1134,12 +1138,27 @@
+ 
+ 					Some(client_message::Payload::Authenticate(auth)) => {
+ 						let key_id = client_fingerprint.clone().ok_or_else(|| anyhow::anyhow!("Authenticate received before Hello"))?;
+ 						mobile_debug_log(&format!("AUTH_RX_PLAINTEXT peer={} fingerprint={} request_id={}", peer, key_id, auth.request_id));
+ 
+-						// THIS is the exact point where desktop pairing becomes
+-						// relevant. Discovery/Hello never creates a prompt.
++						if AUTHENTICATED_CLIENTS.read().await.contains(&key_id) {
++							authenticated = true;
++							let public_key = CLIENT_PUBLIC_KEYS
++								.read()
++								.await
++								.get(&key_id)
++								.cloned()
++								.ok_or_else(|| anyhow::anyhow!("No public key for trusted Mobile {key_id}"))?;
++							let peer_key = PublicKey::from(<[u8; 32]>::try_from(public_key.as_slice()).map_err(|_| anyhow::anyhow!("Invalid Mobile public key"))?);
++							let cipher = SalsaBox::new(&peer_key, &server_secret_key());
++							ws_tx.send(WsMessage::Binary(ok(auth.request_id).encode_to_vec().into())).await?;
++							send_virtual_device_list(&ws_tx, &cipher, &key_id).await?;
++							PENDING_PAIRINGS.write().await.remove(&key_id);
++							log::info!("[VSD2] already trusted Authenticate accepted from {peer}: request_id={}; awaiting OpenVirtualDevice", auth.request_id);
++							continue;
++						}
++
+ 						{
+ 							let mut pending = PENDING_PAIRINGS.write().await;
+ 							let entry = pending.entry(key_id.clone()).or_insert_with(|| PendingPairing {
+ 								fingerprint: key_id.clone(),
+ 								name: CURRENT_V47_MOBILE_DEVICE_NAME.to_owned(),
